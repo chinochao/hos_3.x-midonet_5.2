@@ -1,0 +1,680 @@
+---
+### Repo Configuration - LifeCycle Node
+- hosts: helion-cp1-c0-m1-mgmt
+  vars:
+    aptly_conf: |
+      {
+        "rootDir": "/opt/hlm_packager/hlm/thirdparty",
+        "downloadConcurrency": 4,
+        "downloadSpeedLimit": 0,
+        "architectures": ["amd64"],
+        "dependencyFollowSuggests": false,
+        "dependencyFollowRecommends": false,
+        "dependencyFollowAllVariants": false,
+        "dependencyFollowSource": false,
+        "gpgDisableSign": false,
+        "gpgDisableVerify": false,
+        "downloadSourcePackages": false,
+        "ppaDistributorID": "hLinux",
+        "ppaCodename": "",
+        "S3PublishEndpoints": {}
+      }
+  tasks:
+    - name: MidoNet Integration | Repo Configuration | Aptly Check
+      shell: sudo dpkg -l|grep aptly
+      sudo: yes
+      register: aptly_check
+      ignore_errors: yes
+
+    - name: MidoNet Integration | Repo Configuration | Aptly Installation
+      shell: dpkg -i /home/stack/MidoNet_v52/midonet_v52_repo/aptly_0.8-3_amd64.deb
+      sudo: yes
+      when: aptly_check.rc != 0
+
+    - name: MidoNet Integration | Repo Configuration | Aptly Repo Config
+      copy: dest='/etc/aptly.conf' content='{{ aptly_conf }}'
+      sudo: yes
+      when: aptly_check.rc != 0
+
+    - name: MidoNet Integration | Repo Configuration | Aptly Repo Setup
+      shell: '{{ item }}'
+      sudo: yes
+      with_items:
+        - aptly repo create thirdparty
+        - aptly repo add thirdparty /home/stack/MidoNet_v52/midonet_v52_repo
+        - aptly snapshot create snap1 from repo thirdparty
+        - aptly publish snapshot -distribution="cattleprod" -skip-signing=true snap1
+      when: aptly_check.rc != 0
+
+- hosts: all
+  tasks:
+    - name: MidoNet Integration | Repo Configuration | Setup Repos
+      apt_repository: repo='deb [arch=amd64] http://{{ deployer }}:79/hlm/thirdparty/public cattleprod main' state=present update_cache=yes
+      sudo: yes
+
+### OpenVSwitch Removal
+- hosts: NEU-SVR,entry-scale-kvm-vsa-control-plane-1-compute
+  tasks:
+    - name: MidoNet Integration | Network Bridge Bridge | Install Bridge Utils Package
+      apt: name=bridge-utils state=present force=yes
+      sudo: yes
+
+    - name: MidoNet Integration | OpenVSwitch Removal | Update KeepAlived
+      replace:
+        dest=/etc/keepalived/keepalived.conf
+        regexp='br-eth0'
+        replace='eth0'
+        backup=yes
+      sudo: yes
+      when: "'comp' not in '{{ inventory_hostname }}'"
+
+    - name: MidoNet Integration | OpenVSwitch Removal | OVS Command Check
+      stat: path=/usr/bin/ovs-vsctl
+      register: ovs_path
+      ignore_errors: yes
+
+    - name: MidoNet Integration | OpenVSwitch Removal | OVS Bridge Check
+      shell: ovs-vsctl list-br|grep br-eth0
+      register: ovs_br_check
+      ignore_errors: yes
+      sudo: yes
+      when: ovs_path.stat.exists == True
+      changed_when: ovs_br_check.rc == 1
+
+    - name: MidoNet Integration | OpenVSwitch Removal | Set Network Variables
+      set_fact:
+        ip_addr: "{{ ansible_default_ipv4.address }}"
+        ip_mask: "{{ ansible_default_ipv4.netmask }}"
+        ip_gate: "{{ ansible_default_ipv4.gateway }}"
+      when: ovs_path.stat.exists == True and ovs_br_check.rc == 0
+
+    - name: MidoNet Integration | Network Bridge Bridge | Create Network eth0
+      shell: |
+        cat <<" EOF" > /etc/network/interfaces.d/25-eth0
+        auto eth0
+        iface eth0 inet static
+          address {{ ansible_default_ipv4.address }}
+          netmask {{ ansible_default_ipv4.netmask }}
+          gateway {{ ansible_default_ipv4.gateway }}
+          pre-up ethtool -K eth0 lro off || true
+          up ip link set eth0 up || true
+
+        EOF
+      sudo: yes
+      notify:
+        - restart_networking
+        - restart_keepalived
+
+    - name: MidoNet Integration | OpenVSwitch Removal | Remove OVS Bridge and Setup eth0
+      shell: ovs-vsctl del-br br-eth0 ; ifdown eth0; ifup eth0
+      sudo: yes
+      when: ovs_path.stat.exists == True and ovs_br_check.rc == 0
+
+    - name: MidoNet Integration | OpenVSwitch Removal | Remove All OVS Bridges
+      shell: ovs-vsctl list-br | while read br; do ovs-vsctl del-br $br; done
+      sudo: yes
+      when: ovs_path.stat.exists == True and ovs_br_check.rc == 0
+      notify:
+        - ovs_neutron-metadata-dhcp_stopped
+
+  handlers:
+    - name: ovs_neutron-metadata-dhcp_stopped
+      service: name='{{ item }}' state=stopped enabled=no
+      sudo: yes
+      with_items:
+        - openvswitch-switch
+        - neutron-openvswitch-agent
+#        - neutron-dhcp-agent
+#        - neutron-metadata-agent
+
+    - name: restart_networking
+      service: name=networking state=restarted
+      sudo: yes
+
+    - name: restart_keepalived
+      service: name=keepalived state=restarted
+      sudo: yes
+
+### Keystone Integration AND MidoNet Client - LifeCycle Node
+- hosts: helion-cp1-c0-m1-mgmt
+  tasks:
+    ### Keystone Integration
+    - name: MidoNet Integration | Keystone Integration | Check MidoNet OpenStack Service
+      shell: . ~/keystone.osrc && openstack service list|grep midonet
+      register: midonet_service
+      ignore_errors: yes
+      changed_when: midonet_service.rc == 0
+
+    - name: MidoNet Integration | Keystone Integration | Check MidoNet OpenStack User
+      shell: . ~/keystone.osrc && openstack user list|grep midonet
+      register: midonet_user
+      ignore_errors: yes
+      changed_when: midonet_user.rc == 0
+
+    - name: MidoNet Integration | Keystone Integration | Create MidoNet OpenStack Service
+      shell: . ~/keystone.osrc && openstack service create --name midonet --description "MidoNet API Service" midonet
+      when: midonet_service.rc != 0
+
+    - name: MidoNet Integration | Keystone Integration | Create MidoNet OpenStack User
+      shell: . ~/keystone.osrc && openstack user create --domain default --password midonet midonet
+      register: midonet_user_id
+      when: midonet_user.rc != 0
+
+    - name: MidoNet Integration | Keystone Integration | Create MidoNet OpenStack Role
+      shell: . ~/keystone.osrc && openstack role add --project services --user midonet admin
+      when: midonet_user.rc != 0
+
+### MidoNet MySQL DB
+- hosts: NEU-SVR[0]
+  tasks:
+    ### MidoNet MySQL DB
+    - name: MidoNet Integration | MidoNet MySQL DB | Check MidoNet DB
+      shell: mysql -e "show databases"|grep midonet_neutron
+      register: midonet_db
+      ignore_errors: yes
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet MySQL DB | Create MidoNet DB
+      shell: mysql -e "CREATE DATABASE midonet_neutron;"
+      sudo: yes
+      when: midonet_db.rc != 0
+
+    - name: MidoNet Integration | MidoNet MySQL DB | Grant MidoNet DB User Priv
+      shell: '{{ item }}'
+      sudo: yes
+      when: midonet_db.rc != 0
+      with_items:
+        - mysql -e "GRANT ALL PRIVILEGES ON midonet_neutron.* TO 'midonet_user'@'localhost' IDENTIFIED BY 'midonet';"
+        - mysql -e "GRANT ALL PRIVILEGES ON midonet_neutron.* TO 'midonet_user'@'%' IDENTIFIED BY 'midonet';"
+        - mysql -e "FLUSH PRIVILEGES;"
+
+### Neutron Integration
+- hosts: NEU-SVR
+  vars:
+    midonetrc: |
+      [cli]
+      api_url = http://{{ vip }}:8181/midonet-api
+      username = admin
+      password = {{ admin_password }}
+      project_id = admin
+    midonet_ini: |
+      [database]
+      connection = mysql://midonet_user:midonet@helion-cp1-vip-FND-MDB-mgmt/midonet_neutron
+
+      [midonet]
+      midonet_uri = http://{{ vip }}:8181/midonet-api
+      username = midonet
+      password = midonet
+      project_id = services
+    haproxy_config: |
+      listen helion-cp1-vip-FND-MDB-mgmt:8181
+           bind helion-cp1-vip-FND-MDB-mgmt:8181
+           server helion-cp1-c1-m1-mgmt-FND_MDB-8181 helion-cp1-c1-m1-mgmt:8182 check port 9500 inter 12000 rise 3 fall 3
+           server helion-cp1-c1-m2-mgmt-FND_MDB-8181 helion-cp1-c1-m2-mgmt:8182 check port 9500 inter 12000 rise 3 fall 3
+           server helion-cp1-c1-m3-mgmt-FND_MDB-8181 helion-cp1-c1-m3-mgmt:8182 check port 9500 inter 12000 rise 3 fall 3
+    midonet_systemd: |
+      [Unit]
+      Description=MidoNet Control cluster node
+      After=network.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/share/midonet-cluster/midonet-cluster-start
+      SuccessExitStatus=143
+      KillMode=process
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+    midonetrc: |
+      [cli]
+      api_url = http://{{ vip }}:8181/midonet-api
+      username = admin
+      password = {{ admin_password }}
+      project_id = admin
+  tasks:
+    ### MidoNet Client
+    - name: MidoNet Integration | MidoNet Client | Install MidoNet Python Client
+      apt: name=python-midonetclient state=present force=yes
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet Client | Midolman Systemd
+      copy: content='{{ midonetrc }}' dest=/home/stack/.midonetrc
+
+    - name: MidoNet Integration | Used Ports | Check IPtables Ports
+      shell: iptables -nvL|grep 61621
+      register: iptables_ports
+      ignore_errors: yes
+      changed_when: iptables_ports.rc == 0
+      sudo: yes
+
+    - name: MidoNet Integration | Used Ports | IPtables Open Ports
+      shell: iptables -I INPUT -p tcp -m tcp --dport {{ item }} -j ACCEPT
+      with_items:
+        # Quagga ports
+        - 179
+        - 2606
+        # MidoNet Api - needed for midonet.ini OpenStack Plugin
+        - 8181
+        - 8182
+        # Public Port
+        - 8888
+        # Cassandra inte-node ports
+        - 7000
+        - 7001
+        - 7199
+        # Cassandra client ports
+        - 9042
+        - 9160
+        # Cassandra OpsCenter ports
+        - 61620
+        - 61621
+      when: iptables_ports.rc != 0
+      sudo: yes
+
+    - name: MidoNet Integration | HAProxy Config | Check HAProxy Port 8181
+      shell: grep 8181 /etc/haproxy/haproxy.cfg
+      sudo: yes
+      ignore_errors: yes
+      register: haproxy_check
+
+    - name: MidoNet Integration | HAProxy Config | Add HAProxy Port 8181
+      shell: echo '{{ haproxy_config }}' >> /etc/haproxy/haproxy.cfg
+      sudo: yes
+      when: haproxy_check.rc != 0
+
+    - name: MidoNet Integration | HAProxy Config | Restart HAProxy
+      service: name=haproxy state=restarted
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet Plugin | Openstack MidoNet Plugin Check
+      # find returns 0 even if there are no files, piping with grep to return 0 or 1
+      shell: find /opt/stack/service/neutron/venv -type d -name "midonet"|grep midonet
+      register: midonet_driver_check
+      ignore_errors: yes
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet Plugin | MidoNet Python Client Check
+      # find returns 0 even if there are no files, piping with grep to return 0 or 1
+      shell: find /opt/stack/service/neutron/venv -type d -name "midonetclient"|grep midonetclient
+      register: midonetclient_check
+      ignore_errors: yes
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet Plugin | Extract OpenStack MidoNet Plugin
+      unarchive: src=/home/stack/MidoNet_v52/midokura-neutron-plugin.tgz dest=/opt/stack/service/neutron/venv/ copy=yes
+      sudo: yes
+      when: midonet_driver_check.rc != 0
+
+    - name: MidoNet Integration | MidoNet Plugin | Extract MidoNet Python Client
+      unarchive: src=/home/stack/MidoNet_v52/python-midonetclient.tgz dest=/opt/stack/service/neutron/venv/ copy=yes
+      sudo: yes
+      when: midonetclient_check.rc != 0
+
+    - name: MidoNet Integration | MidoNet Plugin | Neutron Plugin Directory
+      file: path=/opt/stack/service/neutron/venv/etc/neutron/plugins/midonet/ state=directory recurse=yes
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet Plugin | MidoNet.ini Plugin Configuration
+      copy: content='{{ midonet_ini }}' dest=/opt/stack/service/neutron/venv/etc/neutron/plugins/midonet/midonet.ini
+      sudo: yes
+
+    - name: MidoNet Integration | Neutron Integration | Neutron Configuration
+      replace: dest=/opt/stack/service/neutron/etc/neutron.conf
+               regexp='{{ item.reg }}'
+               replace='{{ item.rep }}'
+      sudo: yes
+      register: neutron_config
+      with_items:
+        - {reg: '^core_plugin.*$', rep: 'core_plugin = midonet.neutron.plugin_v2.MidonetPluginV2'}
+        - {reg: '^service_plugins.*$', rep: 'service_plugins = vpnaas,lbaas,midonet.neutron.services.firewall.plugin.MidonetFirewallPlugin,midonet.neutron.services.l3.l3_midonet.MidonetL3ServicePlugin'}
+        - {reg: '^allow_overlapping_ips.*$', rep: 'allow_overlapping_ips = True\ndhcp_agent_notification = False'}
+        - {reg: '^service_provider.*LOADBALANCERV.*default$', rep: 'service_provider = LOADBALANCER:Midonet:midonet.neutron.services.loadbalancer.driver.MidonetLoadbalancerDriver:default'}
+        - {reg: '^service_provider.*VPN.*$', rep: 'service_provider = VPN:Midonet:midonet.neutron.services.vpn.service_drivers.midonet_ipsec.MidonetIPsecVPNDriver:default'}
+
+    # This seems to conflict with the midonet.ini as it contains MySQL DB connection as well.
+    - name: MidoNet Integration | Neutron Integration | Neutron Update ml2_conf.ini
+      replace: dest=/opt/stack/service/neutron/etc/ml2_conf.ini
+               regexp='{{ item.reg }}'
+               replace='{{ item.rep }}'
+      sudo: yes
+      register: ml2_config
+      with_items:
+        - {reg: '^tenant_network_types.*$', rep: 'tenant_network_types = midonet,vlan,vxlan'}
+        - {reg: '^type_drivers.*$', rep: 'type_drivers = midonet,uplink'}
+        - {reg: '^mechanism_drivers.*$', rep: 'mechanism_drivers = midonet'}
+        - {reg: '^connection.*$', rep: 'connection = mysql://midonet_user:midonet@helion-cp1-vip-FND-MDB-mgmt/midonet_neutron'}
+
+    - name: MidoNet Integration | Neutron Integration | Neutron Update dhcp_agent.ini
+      replace: dest=/opt/stack/service/neutron/etc/dhcp_agent.ini
+               regexp='{{ item.reg }}'
+               replace='{{ item.rep }}'
+      sudo: yes
+      with_items:
+        - {reg: '^dhcp_driver.*$', rep: 'dhcp_driver = midonet.neutron.agent.midonet_driver.DhcpNoOpDriver'}
+        - {reg: '^interface_driver.*$', rep: 'interface_driver = neutron.agent.linux.interface.MidonetInterfaceDriver'}
+
+    - name: MidoNet Integration | Neutron Integration | Neutron Update l3_agent.ini and lbaas_agent.ini
+      replace: dest='{{ item.file }}'
+               regexp='{{ item.reg }}'
+               replace='{{ item.rep }}'
+      sudo: yes
+      with_items:
+        - {file: '/opt/stack/service/neutron/etc/l3_agent.ini', reg: '^interface_driver.*$', rep: 'interface_driver = neutron.agent.linux.interface.MidonetInterfaceDriver'}
+        - {file: '/opt/stack/service/neutron/etc/l3_agent.ini', reg: '^external_network_bridge.*$', rep: 'external_network_bridge = eth1'}
+        - {file: '/opt/stack/service/neutron/etc/lbaas_agent.ini', reg: '^interface_driver.*$', rep: 'interface_driver = neutron.agent.linux.interface.MidonetInterfaceDriver'}
+
+    - name: MidoNet Integration | Neutron Integration | Neutron Service Stopped
+      service: name=neutron-server state=stopped
+      sudo: yes
+      when: neutron_config.changed and ml2_config.changed
+
+    - name: MidoNet Integration | Neutron Integration | Symlink midonet.ini
+      file: src=/opt/stack/service/neutron/venv/etc/neutron/plugins/midonet/midonet.ini dest=/opt/stack/service/neutron/etc/midonet.ini state=link
+      sudo: yes
+
+    - name: MidoNet Integration | Neutron Integration | Neutron DB Upgrade
+      shell: su -s /bin/sh -c "/opt/stack/service/neutron/venv/bin/neutron-db-manage --config-file=/opt/stack/service/neutron/etc/neutron.conf --config-file=/opt/stack/service/neutron/etc/ml2_conf.ini --config-file=/opt/stack/service/neutron/etc/midonet.ini upgrade head" neutron && su -s /bin/sh -c "/opt/stack/service/neutron/venv/bin/neutron-db-manage --config-file=/opt/stack/service/neutron/etc/neutron.conf --config-file=/opt/stack/service/neutron/etc/ml2_conf.ini --config-file=/opt/stack/service/neutron/etc/midonet.ini --subproject networking-midonet upgrade head" neutron
+      sudo: yes
+      when: "'helion-cp1-c1-m1-mgmt' in '{{ inventory_hostname }}' and neutron_config.changed"
+
+    - name: MidoNet Integration | Neutron Integration | Neutron Startup Script
+      replace: dest=/usr/lib/systemd/system/neutron-server.service
+               regexp='^ExecStart=.*$'
+               replace='ExecStart=/opt/stack/service/neutron/venv/bin/neutron-server --config-file=/opt/stack/service/neutron/etc/neutron.conf --config-file=/opt/stack/service/neutron/etc/ml2_conf.ini --config-file=/opt/stack/service/neutron/etc/midonet.ini --config-file=/opt/stack/service/neutron/etc/server.ini --config-file=/opt/stack/service/neutron/etc/l2gw_plugin.ini --log-file=/var/log/neutron/neutron-server.log'
+      sudo: yes
+
+    - name: MidoNet Integration | Neutron Integration | Neutron Service Started
+      service: name=neutron-server state=started enabled=yes
+      sudo: yes
+      when: neutron_config.changed
+
+    - name: MidoNet Integration | Cassandra Cluster | Install Cassandra Packages
+      apt: name='{{ item }}' state=present force=yes
+      with_items:
+        - openjdk-8-jre-headless
+        - dsc22
+      sudo: yes
+
+    # Require this setting or nodes won't see eachother when running nodetool status
+    - name: MidoNet Integration | Cassandra Cluster | Cassandra Env
+      replace:
+        dest=/etc/cassandra/cassandra-env.sh
+        regexp='^# JVM_OPTS="$JVM_OPTS -Djava.rmi.server.hostname=<public name>"'
+        replace='JVM_OPTS="$JVM_OPTS -Djava.rmi.server.hostname={{  ansible_default_ipv4.address }}"'
+      sudo: yes
+
+    - name: MidoNet Integration | Cassandra Cluster | Cassandra Config
+      replace:
+        dest=/etc/cassandra/cassandra.yaml
+        regexp='{{ item.exp }}'
+        replace='{{  item.rep }}'
+        backup=yes
+      with_items:
+        - { exp: 'Test Cluster', rep: 'MidoNet Cluster' }
+        - { exp: '127.0.0.1', rep: 'helion-cp1-c1-m1-mgmt,helion-cp1-c1-m2-mgmt,helion-cp1-c1-m3-mgmt' }
+        - {exp: 'localhost', rep: '{{ inventory_hostname }}'}
+      sudo: yes
+      notify:
+        - cassandra_stop
+        - cassandra_remove
+        - cassandra_start
+
+    - name: MidoNet Integration | MidoNet Cluster | Install MidoNet Cluster Packages
+      apt: name=midonet-cluster state=present force=yes
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet Cluster | NSDB Config Check
+      shell: mn-conf dump -t default|grep "cassandra {"
+      register: nsdb_config_check
+      ignore_errors: yes
+      sudo: yes
+      changed_when: nsdb_config_check.rc == 0
+
+    - name: MidoNet Integration | MidoNet Cluster | Cluster Auth Config Check
+      shell: mn-conf dump -t default|grep "keystone {"
+      register: cluster_config_check
+      ignore_errors: yes
+      sudo: yes
+      changed_when: cluster_config_check.rc == 0
+
+    - name: MidoNet Integration | MidoNet Cluster | Get Admin Token
+      shell: awk '/admin_token/ {print $3}' /opt/stack/service/keystone/etc/keystone.conf
+      register: admin_token
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet Cluster | NSDB Configuration
+      shell: |
+        cat <<" EOF" | mn-conf set -t default
+        zookeeper {
+            zookeeper_hosts = "helion-cp1-c1-m1-mgmt:2181,helion-cp1-c1-m2-mgmt:2181,helion-cp1-c1-m3-mgmt:2181"
+        }
+
+        cassandra {
+            "replication_factor"=3
+            servers = "helion-cp1-c1-m1-mgmt,helion-cp1-c1-m2-mgmt,helion-cp1-c1-m3-mgmt"
+        }
+        EOF
+      sudo: yes
+      when: nsdb_config_check.rc != 0
+
+    - name: MidoNet Integration | MidoNet Cluster | MidoNet Cluster Config
+      replace:
+        dest=/etc/midonet/midonet.conf
+        regexp='127.0.0.1:2181'
+        replace='helion-cp1-c1-m1-mgmt:2181,helion-cp1-c1-m2-mgmt:2181,helion-cp1-c1-m3-mgmt:2181'
+        backup=yes
+      sudo: yes
+
+    - name: MidoNet Integration | MidoNet Cluster | MidoNet Cluster KeyStone Access
+      shell: |
+        cat <<" EOF" | mn-conf set -t default
+        cluster.auth {
+            provider_class = "org.midonet.cluster.auth.keystone.KeystoneService"
+            admin_role = "admin"
+            keystone.tenant_name = "admin"
+            keystone.admin_token = {{ admin_token.stdout }}
+            keystone.host = "{{ vip }}"
+            keystone.port = "35357"
+            keystone.protocol = "https"
+            keystone.version = "3"
+        }
+        EOF
+      sudo: yes
+      when: cluster_config_check.rc != 0
+
+    - name: MidoNet Integration | MidoNet Cluster | MidoNet Cluster Systemd
+      copy: content='{{ midonet_systemd }}' dest=/etc/systemd/system/midonet-cluster.service
+      sudo: yes
+      notify:
+        - midonet_systemd_restart
+
+  handlers:
+
+    # Stopping cassandra normally does not seems to kill the process
+    - name: cassandra_stop
+      shell: systemctl stop cassandra; killall -u cassandra -9; ps -U cassandra -u cassandra u
+      register: cassandra_check
+      ignore_errors: yes
+      sudo: yes
+      until: cassandra_check.rc == 1
+      retries: 10
+      delay: 5
+
+    - name: cassandra_remove
+      shell: rm -rf /var/lib/cassandra/*
+      ignore_errors: yes
+      sudo: yes
+
+    - name: cassandra_start
+      service: name=cassandra state=started enabled=yes
+      sudo: yes
+
+    - name: midonet_systemd_restart
+      service: name=midonet-cluster state=restarted enabled=yes
+      sudo: yes
+
+### Midolman Agent
+- hosts: NEU-SVR,entry-scale-kvm-vsa-control-plane-1-compute
+  vars:
+    midolman_systemd: |
+      [Unit]
+      Description=Midolman
+      After=network.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/share/midolman/midolman-start
+      SuccessExitStatus=143
+      KillMode=process
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+  tasks:
+    - name: MidoNet Integration | Midolman | Check libreswan
+      shell: dpkg -l |grep libreswan
+      sudo: yes
+      ignore_errors: yes
+      register: libreswan_check
+
+      # Cannot use apt module as needs the force-overwrite options or else will fail during install as cannot update /etc/ipsec.d/
+      # libreswan package has whiptail which needs interaction, using DEBIAN_FRONTEND to disable and continue with install or it
+      # will hang the installation
+    - name: MidoNet Integration | Midolman | Install libreswan
+      shell: 'yes | DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-overwrite" install libreswan'
+      sudo: yes
+      ignore_errors: yes
+      when: libreswan_check.rc != 0
+
+    - name: MidoNet Integration | Midolman | Install Midolman and Headers
+      apt: name='{{ item }}' state=present force=yes
+      with_items:
+        - openjdk-8-jre-headless
+        - linux-headers-4.4-amd64-hpelinux
+        - midolman
+      sudo: yes
+
+    - name: MidoNet Integration | Midolman | Midolman Config
+      replace:
+        dest=/etc/midolman/midolman.conf
+        regexp='127.0.0.1:2181'
+        replace='helion-cp1-c1-m1-mgmt:2181,helion-cp1-c1-m2-mgmt:2181,helion-cp1-c1-m3-mgmt:2181'
+        backup=yes
+      sudo: yes
+
+    - name: MidoNet Integration | Midolman | Midolman Openstack Metadata Check
+      shell: mn-conf dump -t default|grep "8182"
+      register: midolman_config_check
+      ignore_errors: yes
+      sudo: yes
+      changed_when: midolman_config_check.rc == 0
+
+    - name: MidoNet Integration | Midolman | Get Metadata Token
+      shell: awk '/metadata_proxy_shared_secret/ {print $3}' /opt/stack/service/nova-api/etc/nova/nova.conf
+      register: metadata_token
+      sudo: yes
+      changed_when: midolman_config_check.rc != 0
+      when: "'comp' not in '{{ inventory_hostname }}'"
+
+    - name: MidoNet Integration | Midolman | Midolman OpenStack Metadata Configuration
+      shell: echo '{{ item }}' | mn-conf set -t default
+      with_items:
+        - "cluster.rest_api.http_port = 8182"
+        - "agent.openstack.metadata.nova_metadata_url:\"http://{{ vip }}:8775\""
+        - "agent.openstack.metadata.shared_secret:'{{ metadata_token.stdout }}'"
+        - "agent.openstack.metadata.enabled:true"
+      sudo: yes
+      when: "'comp' not in '{{ inventory_hostname }}' and midolman_config_check.rc != 0"
+      notify:
+        - midonet_systemd_restart
+
+    - name: MidoNet Integration | Neutron Nodes | Midolman Neutron Template
+      shell: mn-conf template-set -h local -t agent-gateway-large
+      sudo: yes
+      when: "'comp' not in '{{ inventory_hostname }}' and midolman_config_check.rc != 0"
+
+    - name: MidoNet Integration | Neutron Nodes | Midolman Neutron Configuration
+      replace:
+        dest=/etc/midolman/midolman-env.sh
+        regexp='2048M'
+        replace='10240M'
+        backup=yes
+      sudo: yes
+      when: "'comp' not in '{{ inventory_hostname }}' and midolman_config_check.rc != 0"
+
+    - name: MidoNet Integration | Midolman | Midolman Systemd
+      copy: content='{{ midolman_systemd }}' dest=/etc/systemd/system/midolman.service
+      sudo: yes
+      notify:
+        - midolman_systemd_restarted
+
+    - name: MidoNet Integration | Midolman | IPtables Metadata Check
+      shell: iptables -nvL|grep metadata
+      register: iptables_metadata
+      ignore_errors: yes
+      sudo: yes
+      changed_when: iptables_metadata.rc == 0
+
+    - name: MidoNet Integration | Neutron-Compute | IPtables Accept Metadata
+      shell: iptables -I INPUT 1 -i metadata -j ACCEPT
+      sudo: yes
+      when: iptables_metadata.rc != 0
+
+  handlers:
+    - name: midolman_systemd_restarted
+      service: name=midolman state=started enabled=yes
+      sudo: yes
+
+    - name: midonet_systemd_restart
+      service: name=midonet-cluster state=restarted enabled=yes
+      sudo: yes
+
+- hosts: entry-scale-kvm-vsa-control-plane-1-compute
+  tasks:
+    - name: MidoNet Integration | Quagga Ports | Check IPtables Ports
+      shell: iptables -nvL|grep 179
+      register: iptables_ports
+      ignore_errors: yes
+      changed_when: iptables_ports.rc == 0
+      sudo: yes
+
+    - name: MidoNet Integration | Quagga Ports | IPtables Open Ports
+      shell: iptables -I INPUT -p tcp -m tcp --dport {{ item }} -j ACCEPT
+      with_items:
+        # Quagga ports
+        - 179
+        - 2606
+      when: iptables_ports.rc != 0
+      sudo: yes
+
+    - name: MidoNet Integration | Libvirt Config | Libvirt Qemu Check
+      shell: grep "/dev/net/tun" /etc/libvirt/qemu.conf
+      sudo: yes
+      register: qemu_check
+      ignore_errors: yes
+      changed_when: qemu_check.rc == 0
+
+    - name: MidoNet Integration | Libvirt Config | Libvirt Qemu Configuration
+      lineinfile: dest=/etc/libvirt/qemu.conf line='cgroup_device_acl = [\n\t"/dev/null", "/dev/full", "/dev/zero",\n\t"/dev/random", "/dev/urandom",\n\t"/dev/ptmx", "/dev/kvm", "/dev/kqemu",\n\t"/dev/rtc","/dev/hpet", "/dev/vfio/vfio",\n\t"/dev/net/tun"\n]'
+      sudo: yes
+      when: qemu_check.rc != 0
+      notify:
+      - libvirt_restarted
+
+    - name: MidoNet Integration | Compute Nodes | Midolman Compute Template
+      shell: mn-conf template-set -h local -t agent-compute-large
+      sudo: yes
+
+    - name: MidoNet Integration | Compute Nodes | Midolman Compute Configuration
+      replace:
+        dest=/etc/midolman/midolman-env.sh
+        regexp='2048M'
+        replace='10240M'
+        backup=yes
+      sudo: yes
+
+  handlers:
+    - name: libvirt_restarted
+      service: name=libvirtd state=restarted enabled=yes
+      sudo: yes

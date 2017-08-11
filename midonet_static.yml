@@ -1,0 +1,163 @@
+---
+### Fake UplinkBridge Setup
+- hosts: NEU-SVR
+  tasks:
+    - name: MidoNet CLI | Tunnel Zone | Create tunnel zone
+      shell: midonet-cli -e tunnel-zone create name tz type vxlan
+      register: mido_zone
+      run_once: true
+
+    - name: MidoNet CLI | Tunnel Zone | Add Members
+      shell: midonet-cli -A -e list host | awk -F' ' '{print $2 " " $4}'| while read id host; do ip=$(awk '/'$host'/ {print $1}' /etc/hosts); midonet-cli -A -e tunnel-zone {{ mido_zone.stdout }} add member host $id address $ip;done
+      run_once: true
+
+    - name: MidoNet Static Route | Interfaces Global | Create Type veth and iveth interfaces
+      shell: '{{ item }}'
+      sudo: yes
+      with_items:
+        - ip link add type veth
+        - ip link set dev veth0 up
+        - ip link set dev veth1 up
+        - brctl addbr uplinkbridge
+        - brctl addif uplinkbridge veth0
+
+    - name: MidoNet Static Route | Interfaces Global | Sysctl Ipv4 Forwarding
+      shell: sysctl -w net.ipv4.ip_forward=1
+      sudo: yes
+
+    - name: MidoNet Static Route | Interfaces Global | IPtables Rules
+      shell: '{{ item }}'
+      sudo: yes
+      with_items:
+        - iptables -t nat -I POSTROUTING -o eth1 -s {{ ext_subnet }} -j MASQUERADE
+        - iptables -I FORWARD -s {{ ext_subnet }} -j ACCEPT
+
+    - name: MidoNet Static Route | Interfaces Gateway 1 | Setup UplinkBridge and IP Route
+      shell: '{{ item }}'
+      sudo: yes
+      with_items:
+        - ip addr add 172.19.0.1/30 dev uplinkbridge
+        - ip link set dev uplinkbridge up
+        - ip route add 10.246.77.0/24 via 172.19.0.2
+      when: "'c1-m1-mgmt' in '{{ inventory_hostname }}'"
+
+    - name: MidoNet Static Route | Interfaces Gateway 2 | Setup UplinkBridge and IP Route
+      shell: '{{ item }}'
+      sudo: yes
+      with_items:
+        - ip addr add 172.19.0.5/30 dev uplinkbridge
+        - ip link set dev uplinkbridge up
+        - ip route add 10.246.77.0/24 via 172.19.0.6
+      when: "'c1-m2-mgmt' in '{{ inventory_hostname }}'"
+
+    - name: MidoNet Static Route | Interfaces Gateway 3 | Setup UplinkBridge and IP Route
+      shell: '{{ item }}'
+      sudo: yes
+      with_items:
+        - ip addr add 172.19.0.9/30 dev uplinkbridge
+        - ip link set dev uplinkbridge up
+        - ip route add 10.246.77.0/24 via 172.19.0.10
+      when: "'c1-m3-mgmt' in '{{ inventory_hostname }}'"
+
+    - name: Neutron | Edge Router Setup
+      shell: '{{ item }}'
+      with_items:
+        - '. ~/service.osrc && neutron router-create edge_router'
+        - '. ~/service.osrc && neutron router-interface-add edge_router ext-subnet'
+        - '. ~/service.osrc && neutron net-create uplink_network --tenant_id admin --provider:network_type uplink'
+      run_once: true
+
+    - name: MidoNet CLI | EXT NET | Controller 1 ID
+      shell: midonet-cli -e list host|awk '/c1-m1/ {print $2}'
+      register: m1_host
+      run_once: true
+
+    - name: MidoNet CLI | EXT NET | Controller 2 ID
+      shell: midonet-cli -e list host|awk '/c1-m2/ {print $2}'
+      register: m2_host
+      run_once: true
+
+    - name: MidoNet CLI | EXT NET | Controller 3 ID
+      shell: midonet-cli -e list host|awk '/c1-m3/ {print $2}'
+      register: m3_host
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Edge Router ID
+      shell: midonet-cli -A -e router list|awk '/edge_router/ {print $2}'
+      register: edge_router_id
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Fake Port ID 1
+      shell: midonet-cli -A -e router {{ edge_router_id.stdout }} add port address 172.19.0.2 net 172.19.0.0/30
+      register: fake_m1
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Edge Router Fake Routing 1
+      shell: midonet-cli -A -e router {{ edge_router_id.stdout }} add route src 0.0.0.0/0 dst 0.0.0.0/0 type normal port router {{ edge_router_id.stdout }}  port {{ fake_m1.stdout}} gw 172.19.0.1
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Fake Port Binding 1
+      shell: midonet-cli -A -e host {{ m1_host.stdout }} add binding port router {{ edge_router_id.stdout }} port {{ fake_m1.stdout }} interface veth1
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Fake Port ID 2
+      shell: midonet-cli -A -e router {{ edge_router_id.stdout }} add port address 172.19.0.6 net 172.19.0.4/30
+      register: fake_m2
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Edge Router Fake Routing 2
+      shell: midonet-cli -A -e router {{ edge_router_id.stdout }} add route src 0.0.0.0/0 dst 0.0.0.0/0 type normal port router {{ edge_router_id.stdout }}  port {{ fake_m2.stdout}} gw 172.19.0.5
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Fake Port Binding 2
+      shell: midonet-cli -A -e host {{ m2_host.stdout }} add binding port router {{ edge_router_id.stdout }} port {{ fake_m2.stdout }} interface veth1
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Fake Port ID 3
+      shell: midonet-cli -A -e router {{ edge_router_id.stdout }} add port address 172.19.0.10 net 172.19.0.8/30
+      register: fake_m3
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Edge Router Fake Routing 3
+      shell: midonet-cli -A -e router {{ edge_router_id.stdout }} add route src 0.0.0.0/0 dst 0.0.0.0/0 type normal port router {{ edge_router_id.stdout }}  port {{ fake_m3.stdout}} gw 172.19.0.9
+      run_once: true
+
+    - name: MidoNet CLI | Edge Router | Fake Port Binding 3
+      shell: midonet-cli -A -e host {{ m3_host.stdout }} add binding port router {{ edge_router_id.stdout }} port {{ fake_m3.stdout }} interface veth1
+      run_once: true
+
+    - name: Nova | Create New Sec Group
+      shell: '{{ item }}'
+      with_items:
+        - '. ~/service.osrc && nova secgroup-create midonet_sg "Midonet Security Group After Deployment"'
+        - '. ~/service.osrc && nova secgroup-add-rule midonet_sg icmp -1 -1 0.0.0.0/0'
+        - '. ~/service.osrc && nova secgroup-add-rule  midonet_sg tcp 22 22 0.0.0.0/0'
+      run_once: true
+
+- hosts: NEU-SVR[0]
+  tasks:
+    - name: MidoNet CLI | EXT NET | Get bridge ID
+      shell: midonet-cli -e bridge list|awk '/ext-net/ {print $2}'
+      register: ext_bridge
+
+    - name: MidoNet CLI | EXT NET | Add M2 Vlan
+      shell: midonet-cli -e bridge {{ ext_bridge.stdout }} add port
+      register: m2_vlan_id
+
+    - name: MidoNet CLI | EXT NET | Controller 2 ID
+      shell: midonet-cli -e list host|awk '/c1-m2/ {print $2}'
+      register: m2_host
+
+    - name: MidoNet CLI | EXT NET | Controller 2 Binding
+      shell: midonet-cli -e host {{ m2_host.stdout }} add binding port bridge {{ ext_bridge.stdout }} port {{ m2_vlan_id.stdout }} interface vlan{{ ext_vlan }}
+
+    - name: MidoNet CLI | EXT NET | Add M3 Vlan
+      shell: midonet-cli -e bridge {{ ext_bridge.stdout }} add port
+      register: m3_vlan_id
+
+    - name: MidoNet CLI | EXT NET | Controller 3 ID
+      shell: midonet-cli -e list host|awk '/c1-m3/ {print $2}'s
+      register: m3_host
+
+    - name: MidoNet CLI | EXT NET | Controller 3 Binding
+      shell: midonet-cli -e host {{ m3_host.stdout }} add binding port bridge {{ ext_bridge.stdout }} port {{ m3_vlan_id.stdout }} interface vlan{{ ext_vlan }}
