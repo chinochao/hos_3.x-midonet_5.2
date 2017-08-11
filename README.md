@@ -17,10 +17,6 @@ HOS versions : 3.0 & 3.0.1
 ### Neutron
 Tested and deploying using playbooks. Ansible Tempest tests pass without errors and manually testing also works. 
 
-| Command | Description |
-| --- | --- |
-| `git status` | List all *new or modified* files |
-| `git diff` | Show file differences that **haven't been** staged |
 | Action| Status|
 | ------------- |:-------------:|
 | Create Networks| :white_check_mark: |
@@ -32,7 +28,8 @@ Tested and deploying using playbooks. Ansible Tempest tests pass without errors 
 | Set Gateway Router | :white_check_mark: |
 
 ### FWaaS 
-Tested and deploying using the playbooks below. The logging firewall creating doesn't work as it is not a subcommand in our neutron version. 
+Tested and deploying using the playbooks below. The logging firewall creating doesn't work as it is not a subcommand in our neutron version.
+
 | Action| Status|
 | ------------- |:-------------:|
 | Create Rules| :white_check_mark: |
@@ -45,6 +42,7 @@ Tested and deploying using the playbooks below. The logging firewall creating do
 
 ### VPNaaS (No Liberty Support) 
 Tested and not deploying using the playbooks below. It seems the last part for the VPN fails to create and Neutron doesn't report any errors. Just returns a API URL error. 
+
 | Action| Status|
 | ------------- |:-------------:|
 | Create VPN IKE Policy| :white_check_mark: |
@@ -53,7 +51,8 @@ Tested and not deploying using the playbooks below. It seems the last part for t
 | Create IPsec Site Connection | :red_circle: |
 
 ### LBaaS 
-Tested and deploying using the playbooks below. \
+Tested and deploying using the playbooks below. 
+
 | Action| Status|
 | ------------- |:-------------:|
 | Create Pools| :white_check_mark: |
